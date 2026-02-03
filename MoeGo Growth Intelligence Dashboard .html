@@ -1147,6 +1147,8 @@
     let COMPUTED = {
         customerMap: new Map(),      // customer_id -> merged data
         leadToCustomer: new Map(),   // lead_id -> customer_id
+        appointmentsByLead: new Map(),
+        transactionByCustomer: new Map(),
         channelMetrics: [],
         cohorts: [],
         segments: []
@@ -1159,6 +1161,101 @@
 
     let CHARTS = {};
     let LOCATIONS = [];
+    const DAYS_MS = 1000 * 60 * 60 * 24;
+
+    function getFieldValue(row, aliases, fallback = '') {
+        if (!row) return fallback;
+        const lower = {};
+        Object.keys(row).forEach(k => { lower[k.toLowerCase()] = row[k]; });
+        for (const alias of aliases) {
+            const value = lower[alias.toLowerCase()];
+            if (value !== undefined && value !== null && String(value).trim() !== '') return value;
+        }
+        return fallback;
+    }
+
+    function toNumber(value, fallback = 0) {
+        if (value === undefined || value === null || value === '') return fallback;
+        const parsed = parseFloat(String(value).replace(/[^0-9.-]/g, ''));
+        return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
+    function toInt(value, fallback = 0) {
+        if (value === undefined || value === null || value === '') return fallback;
+        const parsed = parseInt(String(value).replace(/[^0-9-]/g, ''), 10);
+        return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
+    function toDate(value) {
+        if (!value) return null;
+        const d = new Date(value);
+        return Number.isNaN(d.getTime()) ? null : d;
+    }
+
+    function toBinaryFlag(value) {
+        if (value === true || value === 1) return '1';
+        const v = String(value || '').toLowerCase().trim();
+        return ['1', 'true', 'yes', 'y'].includes(v) ? '1' : '0';
+    }
+
+    function getLeadChannel(lead) {
+        return lead.channel || lead.lead_source || lead.source || '';
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function sanitizeCsvText(value) {
+        return String(value ?? '')
+            .replace(/[\u0000-\u001F\u007F]/g, '')
+            .replace(/[<>]/g, '')
+            .trim();
+    }
+
+    function normalizeLoadedRow(row, type) {
+        const normalized = {};
+        Object.entries(row || {}).forEach(([key, value]) => {
+            normalized[key] = typeof value === 'string' ? sanitizeCsvText(value) : value;
+        });
+        const source = normalized;
+
+        if (type === 'leads') {
+            normalized.lead_id = String(getFieldValue(source, ['lead_id', 'leadid', 'id'], source.lead_id || '')).trim();
+            normalized.channel = String(getFieldValue(source, ['channel', 'lead_source', 'source', 'lead_channel'], source.channel || '')).trim();
+            normalized.company_name = String(getFieldValue(source, ['company_name', 'business_location', 'business_name', 'location_name', 'location'], source.company_name || '')).trim();
+            normalized.convert_to_customer_id = String(getFieldValue(source, ['convert_to_customer_id', 'customer_id', 'converted_customer_id'], source.convert_to_customer_id || '')).trim();
+            normalized.converted_on = String(getFieldValue(source, ['converted_on', 'converted_date', 'convert_time', 'converted_at'], source.converted_on || '')).trim();
+        } else if (type === 'clients') {
+            normalized.customer_id = String(getFieldValue(source, ['customer_id', 'client_id', 'id'], source.customer_id || '')).trim();
+            normalized.business_name = String(getFieldValue(source, ['business_name', 'company_name', 'location', 'location_name'], source.business_name || '')).trim();
+            normalized.total_spend_12m = toNumber(getFieldValue(source, ['total_spend_12m', 'total_spend', 'spend_12m', 'revenue_12m'], source.total_spend_12m));
+            normalized.visits_12m = toInt(getFieldValue(source, ['visits_12m', 'visit_count', 'total_visits'], source.visits_12m));
+            normalized.apv_12m = toNumber(getFieldValue(source, ['apv_12m', 'avg_ticket', 'average_ticket'], source.apv_12m));
+            normalized.days_since_last_visit_12m = toInt(getFieldValue(source, ['days_since_last_visit_12m', 'days_since_last', 'days_since_last_visit'], source.days_since_last_visit_12m), 999);
+            normalized.had_boarding_12m = toBinaryFlag(getFieldValue(source, ['had_boarding_12m', 'had_boarding'], source.had_boarding_12m));
+            normalized.had_daycare_12m = toBinaryFlag(getFieldValue(source, ['had_daycare_12m', 'had_daycare'], source.had_daycare_12m));
+            normalized.had_grooming_12m = toBinaryFlag(getFieldValue(source, ['had_grooming_12m', 'had_grooming'], source.had_grooming_12m));
+            normalized.is_active = toBinaryFlag(getFieldValue(source, ['is_active', 'active'], source.is_active));
+        } else if (type === 'appointments') {
+            normalized.lead_id = String(getFieldValue(source, ['lead_id', 'source_lead_id'], source.lead_id || '')).trim();
+            normalized.customer_id = String(getFieldValue(source, ['customer_id', 'client_id', 'owner_id', 'contact_id'], source.customer_id || '')).trim();
+            normalized.appointment_date = String(getFieldValue(source, ['appointment_date', 'service_date', 'start_time', 'appointment_start', 'booked_at'], source.appointment_date || '')).trim();
+            normalized.status = String(getFieldValue(source, ['status', 'appointment_status', 'state'], source.status || '')).trim();
+        } else if (type === 'transactions') {
+            normalized.customer_id = String(getFieldValue(source, ['customer_id', 'client_id', 'owner_id', 'contact_id'], source.customer_id || '')).trim();
+            normalized.transaction_date = String(getFieldValue(source, ['transaction_date', 'date', 'paid_at', 'checkout_time', 'created_at'], source.transaction_date || '')).trim();
+            normalized.amount = toNumber(getFieldValue(source, ['amount', 'transaction_amount', 'net_sales', 'paid_amount', 'total', 'grand_total'], source.amount));
+            normalized.location = String(getFieldValue(source, ['location', 'business_name', 'company_name'], source.location || '')).trim();
+        }
+
+        return normalized;
+    }
 
     // ============================================
     // FILE HANDLING
@@ -1205,7 +1302,8 @@
                 header: true,
                 skipEmptyLines: true,
                 complete: (results) => {
-                    allData = allData.concat(results.data);
+                    const normalizedRows = (results.data || []).map(row => normalizeLoadedRow(row, type));
+                    allData = allData.concat(normalizedRows);
                     processed++;
 
                     if (processed === fileArray.length) {
@@ -1215,7 +1313,7 @@
                     }
                 },
                 error: (err) => {
-                    infoEl.innerHTML = `<span class="text-red-400">Error: ${err.message}</span>`;
+                    infoEl.textContent = `Error: ${err.message}`;
                 }
             });
         });
@@ -1233,53 +1331,115 @@
         const sources = ['Google', 'Facebook', 'Instagram', 'Referral', 'Walk-in', 'Yelp'];
         const statuses = ['Converted', 'Converted', 'Converted', 'Open', 'Open', 'Lost'];
 
-        // Generate 500 demo leads
+        // Generate 300 demo clients first so converted leads can map correctly
+        DATA.clients = [];
+        const customerIds = [];
+        for (let i = 0; i < 300; i++) {
+            const customerId = `CUST-${2000 + i}`;
+            const daysSince = Math.floor(Math.random() * 200);
+            const spend = Math.random() > 0.15 ? Math.floor(Math.random() * 2000) + 100 : 0;
+            const visits = Math.max(1, Math.floor(spend / 140) + Math.floor(Math.random() * 4));
+
+            DATA.clients.push({
+                customer_id: customerId,
+                business_name: locations[Math.floor(Math.random() * locations.length)],
+                total_spend_12m: spend,
+                visits_12m: visits,
+                apv_12m: visits > 0 ? +(spend / visits).toFixed(2) : 0,
+                days_since_last_visit_12m: daysSince,
+                had_grooming_12m: Math.random() > 0.3 ? '1' : '0',
+                had_boarding_12m: Math.random() > 0.5 ? '1' : '0',
+                had_daycare_12m: Math.random() > 0.7 ? '1' : '0',
+                is_active: daysSince <= 90 ? '1' : '0'
+            });
+            customerIds.push(customerId);
+        }
+
+        // Generate 500 demo leads and keep schema aligned with analytics logic
         DATA.leads = [];
+        const convertedLeads = [];
         for (let i = 0; i < 500; i++) {
             const createDate = new Date();
             createDate.setDate(createDate.getDate() - Math.floor(Math.random() * 180));
             const status = statuses[Math.floor(Math.random() * statuses.length)];
+            const channel = sources[Math.floor(Math.random() * sources.length)];
+            const isConverted = status === 'Converted';
+            const customerId = isConverted ? customerIds[Math.floor(Math.random() * customerIds.length)] : '0';
+            const convertedOn = isConverted
+                ? new Date(createDate.getTime() + (Math.floor(Math.random() * 21) + 1) * DAYS_MS).toISOString()
+                : '';
 
-            DATA.leads.push({
+            const lead = {
                 lead_id: `LEAD-${1000 + i}`,
                 lead_create_time: createDate.toISOString(),
-                lead_source: sources[Math.floor(Math.random() * sources.length)],
+                channel,
+                lead_source: channel,
                 converted_status: status,
+                convert_to_customer_id: customerId,
+                converted_on: convertedOn,
+                converted_first_service_dollar: isConverted ? (Math.floor(Math.random() * 120) + 60) : 0,
+                converted_first_service_type: ['Boarding', 'Grooming', 'Daycare'][Math.floor(Math.random() * 3)],
                 company_name: locations[Math.floor(Math.random() * locations.length)],
                 business_location: locations[Math.floor(Math.random() * locations.length)],
+                first_order_id: isConverted && Math.random() > 0.25 ? `ORDER-${5000 + i}` : '',
                 log_type_count: Math.random() > 0.3 ? 'MESSAGE:2,EMAIL:1' : ''
-            });
+            };
+
+            if (isConverted) convertedLeads.push(lead);
+            DATA.leads.push(lead);
         }
 
-        // Generate 300 demo clients
-        DATA.clients = [];
-        for (let i = 0; i < 300; i++) {
-            const daysSince = Math.floor(Math.random() * 200);
-            const spend = Math.random() > 0.15 ? Math.floor(Math.random() * 2000) + 100 : 0;
+        // Generate demo appointments linked to leads/customers
+        DATA.appointments = convertedLeads.slice(0, 220).map((lead, idx) => {
+            const apptDate = new Date(new Date(lead.converted_on || lead.lead_create_time).getTime() + Math.floor(Math.random() * 14) * DAYS_MS);
+            return {
+                appointment_id: `APT-${8000 + idx}`,
+                lead_id: lead.lead_id,
+                customer_id: lead.convert_to_customer_id,
+                appointment_date: apptDate.toISOString(),
+                status: Math.random() > 0.1 ? 'Completed' : 'No Show',
+                location: lead.company_name
+            };
+        });
 
-            DATA.clients.push({
-                customer_id: `CUST-${2000 + i}`,
-                business_name: locations[Math.floor(Math.random() * locations.length)],
-                total_spend_12m: spend,
-                days_since_last: daysSince,
-                visit_count: Math.floor(Math.random() * 20) + 1,
-                had_grooming: Math.random() > 0.3,
-                had_boarding: Math.random() > 0.5,
-                had_daycare: Math.random() > 0.7,
-                first_visit_date: new Date(Date.now() - Math.random() * 365 * 24 * 60 * 60 * 1000).toISOString()
-            });
-        }
+        // Generate demo transactions linked to converted customers
+        DATA.transactions = convertedLeads.slice(0, 260).map((lead, idx) => {
+            const convDate = toDate(lead.converted_on) || new Date();
+            const txDate = new Date(convDate.getTime() + Math.floor(Math.random() * 70) * DAYS_MS);
+            return {
+                transaction_id: `TX-${9000 + idx}`,
+                customer_id: lead.convert_to_customer_id,
+                transaction_date: txDate.toISOString(),
+                amount: Math.floor(Math.random() * 280) + 40,
+                location: lead.company_name
+            };
+        });
+
+        // Ensure normalization is consistent with uploaded files
+        DATA.leads = DATA.leads.map(row => normalizeLoadedRow(row, 'leads'));
+        DATA.clients = DATA.clients.map(row => normalizeLoadedRow(row, 'clients'));
+        DATA.appointments = DATA.appointments.map(row => normalizeLoadedRow(row, 'appointments'));
+        DATA.transactions = DATA.transactions.map(row => normalizeLoadedRow(row, 'transactions'));
 
         // Update status
-        document.getElementById('leadsStatus').className = 'data-status loaded';
-        document.getElementById('leadsFileInfo').textContent = '500 demo leads';
-        document.getElementById('clientsStatus').className = 'data-status loaded';
-        document.getElementById('clientsFileInfo').textContent = '300 demo clients';
+        [
+            { id: 'leads', count: DATA.leads.length },
+            { id: 'clients', count: DATA.clients.length },
+            { id: 'appointments', count: DATA.appointments.length },
+            { id: 'transactions', count: DATA.transactions.length }
+        ].forEach(({ id, count }) => {
+            document.getElementById(`${id}Status`).className = 'data-status loaded';
+            document.getElementById(`${id}FileInfo`).textContent = `${count.toLocaleString()} demo records`;
+        });
 
-        console.log('Demo data loaded:', { leads: DATA.leads.length, clients: DATA.clients.length });
+        console.log('Demo data loaded:', {
+            leads: DATA.leads.length,
+            clients: DATA.clients.length,
+            appointments: DATA.appointments.length,
+            transactions: DATA.transactions.length
+        });
         processAllData();
     }
-
     // ============================================
     // DATA PROCESSING
     // ============================================
@@ -1301,6 +1461,9 @@
 
         // Build customer map (join leads to clients)
         buildCustomerMap();
+
+        // Enrich customers with appointment + transaction facts
+        computeOperationalMetrics();
 
         // Compute channel metrics
         computeChannelMetrics();
@@ -1331,10 +1494,17 @@
 
         // Update location dropdown
         const select = document.getElementById('globalLocation');
-        select.innerHTML = '<option value="all">All Locations</option>';
+        select.innerHTML = '';
+        const allOption = document.createElement('option');
+        allOption.value = 'all';
+        allOption.textContent = 'All Locations';
+        select.appendChild(allOption);
         LOCATIONS.forEach(loc => {
             const shortName = loc.replace('K9 Resorts Luxury Pet Hotel ', '').replace('K9 Resorts - ', '');
-            select.innerHTML += `<option value="${loc}">${shortName}</option>`;
+            const option = document.createElement('option');
+            option.value = loc;
+            option.textContent = shortName;
+            select.appendChild(option);
         });
     }
 
@@ -1364,22 +1534,27 @@
                         customer_id: customerId,
                         lead_id: lead.lead_id,
                         lead_name: lead.lead_name,
-                        channel: lead.channel || 'Unknown',
+                        channel: getLeadChannel(lead) || 'Unknown',
                         referral_source: lead.referral_source || '',
                         lead_create_time: lead.lead_create_time,
                         converted_on: lead.converted_on,
                         first_service_type: lead.converted_first_service_type,
-                        first_service_dollar: parseFloat(lead.converted_first_service_dollar) || 0,
+                        first_service_dollar: toNumber(lead.converted_first_service_dollar),
                         location: lead.company_name,
                         // From client data
-                        total_spend_12m: parseFloat(client.total_spend_12m) || 0,
-                        visits_12m: parseInt(client.visits_12m) || 0,
-                        apv_12m: parseFloat(client.apv_12m) || 0,
-                        days_since_last: parseInt(client.days_since_last_visit_12m) || 999,
+                        total_spend_12m: toNumber(client.total_spend_12m),
+                        visits_12m: toInt(client.visits_12m),
+                        apv_12m: toNumber(client.apv_12m),
+                        days_since_last: toInt(getFieldValue(client, ['days_since_last_visit_12m', 'days_since_last', 'days_since_last_visit'], 999), 999),
                         had_boarding: client.had_boarding_12m === '1',
                         had_daycare: client.had_daycare_12m === '1',
                         had_grooming: client.had_grooming_12m === '1',
-                        is_active: client.is_active === '1'
+                        is_active: client.is_active === '1',
+                        revenue90d: 0,
+                        txCount90d: 0,
+                        apptCount90d: 0,
+                        apptCompleted90d: 0,
+                        total_tx_revenue: 0
                     });
                 }
             }
@@ -1388,11 +1563,88 @@
         console.log(`Built customer map with ${COMPUTED.customerMap.size} customers`);
     }
 
+    function computeOperationalMetrics() {
+        COMPUTED.appointmentsByLead.clear();
+        COMPUTED.transactionByCustomer.clear();
+
+        // Parse appointments once for funnel + customer enrichment.
+        DATA.appointments.forEach(appt => {
+            const leadId = String(getFieldValue(appt, ['lead_id', 'source_lead_id'], appt.lead_id || '')).trim();
+            const customerId = String(getFieldValue(appt, ['customer_id', 'client_id', 'owner_id', 'contact_id'], appt.customer_id || '')).trim();
+            const status = String(getFieldValue(appt, ['status', 'appointment_status', 'state'], appt.status || '')).toLowerCase().trim();
+            const apptDate = toDate(getFieldValue(appt, ['appointment_date', 'service_date', 'start_time', 'appointment_start', 'booked_at'], appt.appointment_date));
+
+            const isCancelled = status.includes('cancel');
+            const isCompleted = status.includes('complete') || status.includes('checked out') || status.includes('arrived') || status.includes('done');
+
+            if (leadId) {
+                if (!COMPUTED.appointmentsByLead.has(leadId)) COMPUTED.appointmentsByLead.set(leadId, { booked: 0, completed: 0 });
+                const leadStats = COMPUTED.appointmentsByLead.get(leadId);
+                if (!isCancelled) leadStats.booked++;
+                if (isCompleted) leadStats.completed++;
+            }
+
+            if (!customerId || !COMPUTED.customerMap.has(customerId) || !apptDate) return;
+            const customer = COMPUTED.customerMap.get(customerId);
+            const convertedOn = toDate(customer.converted_on);
+            const daysFromConversion = convertedOn ? Math.floor((apptDate - convertedOn) / DAYS_MS) : null;
+            const inFirst90d = daysFromConversion !== null && daysFromConversion >= 0 && daysFromConversion <= 90;
+
+            if (!isCancelled && inFirst90d) customer.apptCount90d++;
+            if (isCompleted && inFirst90d) customer.apptCompleted90d++;
+        });
+
+        DATA.transactions.forEach(tx => {
+            const customerId = String(getFieldValue(tx, ['customer_id', 'client_id', 'owner_id', 'contact_id'], tx.customer_id || '')).trim();
+            const txDate = toDate(getFieldValue(tx, ['transaction_date', 'date', 'paid_at', 'checkout_time', 'created_at'], tx.transaction_date));
+            const amount = toNumber(getFieldValue(tx, ['amount', 'transaction_amount', 'net_sales', 'paid_amount', 'total', 'grand_total'], tx.amount));
+            if (!customerId || !txDate || amount <= 0) return;
+
+            if (!COMPUTED.transactionByCustomer.has(customerId)) {
+                COMPUTED.transactionByCustomer.set(customerId, {
+                    revenue: 0,
+                    revenue90d: 0,
+                    txCount: 0,
+                    txCount90d: 0,
+                    lastTxDate: null
+                });
+            }
+
+            const metrics = COMPUTED.transactionByCustomer.get(customerId);
+            metrics.revenue += amount;
+            metrics.txCount++;
+            if (!metrics.lastTxDate || txDate > metrics.lastTxDate) metrics.lastTxDate = txDate;
+
+            if (COMPUTED.customerMap.has(customerId)) {
+                const customer = COMPUTED.customerMap.get(customerId);
+                const convertedOn = toDate(customer.converted_on);
+                const daysFromConversion = convertedOn ? Math.floor((txDate - convertedOn) / DAYS_MS) : null;
+                if (daysFromConversion !== null && daysFromConversion >= 0 && daysFromConversion <= 90) {
+                    metrics.revenue90d += amount;
+                    metrics.txCount90d++;
+                }
+            }
+        });
+
+        const now = new Date();
+        COMPUTED.customerMap.forEach((customer, customerId) => {
+            const tx = COMPUTED.transactionByCustomer.get(customerId);
+            if (tx) {
+                customer.total_tx_revenue = tx.revenue;
+                customer.revenue90d = tx.revenue90d;
+                customer.txCount90d = tx.txCount90d;
+                if (customer.days_since_last === 999 && tx.lastTxDate) {
+                    customer.days_since_last = Math.max(0, Math.floor((now - tx.lastTxDate) / DAYS_MS));
+                }
+            }
+        });
+    }
+
     function computeChannelMetrics() {
         const channelStats = new Map();
 
         DATA.leads.forEach(lead => {
-            const channel = normalizeChannel(lead.channel);
+            const channel = normalizeChannel(getLeadChannel(lead));
 
             if (!channelStats.has(channel)) {
                 channelStats.set(channel, {
@@ -1416,9 +1668,7 @@
 
                 const customer = COMPUTED.customerMap.get(lead.convert_to_customer_id);
                 if (customer) {
-                    // Use total_spend_12m as proxy for 90D revenue (or actual if available)
-                    // In practice, you'd calculate actual 90D revenue from transactions
-                    const revenue90d = customer.total_spend_12m;  // Proxy - ideally filter transactions to first 90 days
+                    const revenue90d = customer.revenue90d > 0 ? customer.revenue90d : customer.total_spend_12m;
                     stats.total90DRevenue += revenue90d;
                     stats.totalLTV += customer.total_spend_12m;
                     if (customer.days_since_last <= 90) stats.retained90d++;
@@ -1483,7 +1733,7 @@
         const channelStats = new Map();
 
         leads.forEach(lead => {
-            const channel = normalizeChannel(lead.channel);
+            const channel = normalizeChannel(getLeadChannel(lead));
 
             if (!channelStats.has(channel)) {
                 channelStats.set(channel, {
@@ -1503,7 +1753,8 @@
                 stats.converted++;
                 const customer = customerMap.get(lead.convert_to_customer_id) || COMPUTED.customerMap.get(lead.convert_to_customer_id);
                 if (customer) {
-                    stats.total90DRevenue += customer.total_spend_12m || 0;
+                    const revenue90d = customer.revenue90d > 0 ? customer.revenue90d : (customer.total_spend_12m || 0);
+                    stats.total90DRevenue += revenue90d;
                     stats.totalLTV += customer.total_spend_12m || 0;
                     if (customer.days_since_last <= 90) stats.retained90d++;
                 }
@@ -1694,7 +1945,7 @@
         // THREE-LAYER METRICS
         const newLeads = leads.length;
         const convertedCustomers = leads.filter(l => l.converted_status === 'Converted').length;
-        const payingCustomers = customers.filter(c => c.total_spend_12m > 0).length;
+        const payingCustomers = customers.filter(c => (c.revenue90d || 0) > 0 || c.total_spend_12m > 0).length;
         const activeCustomers = customers.filter(c => c.days_since_last <= 90).length;
 
         const leadToCustomerRate = newLeads > 0 ? (convertedCustomers / newLeads * 100).toFixed(0) : 0;
@@ -1752,7 +2003,7 @@
         // 1. Channel Gap Analysis - find channels underperforming vs benchmark
         const channelByLoc = {};
         leads.forEach(l => {
-            const ch = normalizeChannel(l.channel);
+            const ch = normalizeChannel(getLeadChannel(l));
             const loc = l.company_name || 'Unknown';
             const key = `${loc}|${ch}`;
             if (!channelByLoc[key]) channelByLoc[key] = { loc, ch, leads: 0, converted: 0 };
@@ -2040,7 +2291,7 @@
         // Top Channel
         const channelCounts = {};
         leads.forEach(l => {
-            const ch = normalizeChannel(l.channel);
+            const ch = normalizeChannel(getLeadChannel(l));
             channelCounts[ch] = (channelCounts[ch] || 0) + 1;
         });
         const sortedChannels = Object.entries(channelCounts).sort((a, b) => b[1] - a[1]);
@@ -2079,7 +2330,7 @@
         // Analyze channel performance
         const channelStats = {};
         leads.forEach(l => {
-            const ch = normalizeChannel(l.channel);
+            const ch = normalizeChannel(getLeadChannel(l));
             if (!channelStats[ch]) channelStats[ch] = { leads: 0, converted: 0 };
             channelStats[ch].leads++;
             if (l.converted_status === 'Converted') channelStats[ch].converted++;
@@ -2236,7 +2487,7 @@
 
         const channelCounts = {};
         leads.forEach(l => {
-            const ch = normalizeChannel(l.channel);
+            const ch = normalizeChannel(getLeadChannel(l));
             channelCounts[ch] = (channelCounts[ch] || 0) + 1;
         });
 
@@ -2627,8 +2878,20 @@
                    l.log_type_count.includes('CALL:') ||
                    l.log_type_count.includes('NOTE:');
         }).length;
-        const booked = leads.filter(l => l.first_order_id && l.first_order_id !== '' && l.first_order_id !== '0').length;
-        const paid = leads.filter(l => l.converted_status === 'Converted').length;
+        const leadIds = new Set(leads.map(l => String(l.lead_id || '').trim()).filter(Boolean));
+        const bookedFromAppointments = Array.from(leadIds).reduce((sum, leadId) => {
+            const stats = COMPUTED.appointmentsByLead.get(leadId);
+            return sum + (stats ? stats.booked : 0);
+        }, 0);
+        const bookedFallback = leads.filter(l => l.first_order_id && l.first_order_id !== '' && l.first_order_id !== '0').length;
+        const booked = bookedFromAppointments > 0 ? bookedFromAppointments : bookedFallback;
+
+        const paidFromTransactions = leads.filter(l => {
+            const customerId = String(l.convert_to_customer_id || '').trim();
+            const tx = customerId ? COMPUTED.transactionByCustomer.get(customerId) : null;
+            return tx && tx.revenue > 0;
+        }).length;
+        const paid = paidFromTransactions > 0 ? paidFromTransactions : leads.filter(l => l.converted_status === 'Converted').length;
 
         // Qualified = Hot Lead + Prospect (leads with engagement signals)
         const qualified = leads.filter(l => {
@@ -2726,7 +2989,7 @@
         // Group leads by channel (using the normalized channel function)
         const channelData = {};
         leads.forEach(l => {
-            let channel = normalizeChannel(l.channel);
+            let channel = normalizeChannel(getLeadChannel(l));
             // Map to Sankey channel names
             if (channel === 'Walk-in') channel = 'Manual';
             if (channel === 'Phone') channel = 'Manual';  // Merge into Manual Entry
@@ -3329,7 +3592,7 @@
 
         leads.forEach(l => {
             const month = l.lead_create_time?.substring(0, 7);
-            const channel = normalizeChannel(l.channel);
+            const channel = normalizeChannel(getLeadChannel(l));
             if (!month || channel === 'Unknown') return;
 
             if (!monthlyByChannel[month]) {
@@ -3349,7 +3612,7 @@
         });
 
         const months = Object.keys(monthlyByChannel).sort();
-        const allChannels = [...new Set(leads.map(l => normalizeChannel(l.channel)))].filter(c => c !== 'Unknown');
+        const allChannels = [...new Set(leads.map(l => normalizeChannel(getLeadChannel(l))))].filter(c => c !== 'Unknown');
 
         // Sort channels by total leads
         const channelTotals = {};
@@ -3804,16 +4067,19 @@
             const action = getSmartRecommendation(c);
             const valueTag = c.total_spend_12m >= 500 ? '<span class="px-1.5 py-0.5 bg-green-500/20 text-green-400 text-xs rounded mr-2">VIP</span>' :
                             c.total_spend_12m >= 100 ? '<span class="px-1.5 py-0.5 bg-blue-500/20 text-blue-400 text-xs rounded mr-2">Regular</span>' : '';
+            const customerName = escapeHtml(c.lead_name || `Customer ${c.customer_id}`);
+            const locationName = escapeHtml(c.location?.replace('K9 Resorts - ', '') || '-');
+            const safeAction = escapeHtml(action);
 
             return `
                 <tr class="border-b border-slate-700/50 hover:bg-slate-800/30">
-                    <td class="py-3 pr-4">${valueTag}${c.lead_name || 'Customer ' + c.customer_id}</td>
-                    <td class="py-3 pr-4 text-slate-400">${c.location?.replace('K9 Resorts - ', '') || '-'}</td>
+                    <td class="py-3 pr-4">${valueTag}${customerName}</td>
+                    <td class="py-3 pr-4 text-slate-400">${locationName}</td>
                     <td class="py-3 pr-4 text-right">$${c.total_spend_12m.toLocaleString()}</td>
                     <td class="py-3 pr-4 text-right">${c.visits_12m}</td>
                     <td class="py-3 pr-4 text-right">${c.days_since_last}</td>
                     <td class="py-3 pr-4 ${riskColor} font-medium">${riskLevel}</td>
-                    <td class="py-3 text-sm text-slate-300">${action}</td>
+                    <td class="py-3 text-sm text-slate-300">${safeAction}</td>
                 </tr>
             `;
         }).join('');
@@ -4537,10 +4803,10 @@
 
         // Risk 1: Manual channel scaling bottleneck
         const manualLeads = leads.filter(l =>
-            normalizeChannel(l.channel) === 'Walk-in' || normalizeChannel(l.channel) === 'Phone'
+            normalizeChannel(getLeadChannel(l)) === 'Walk-in' || normalizeChannel(getLeadChannel(l)) === 'Phone'
         );
         const manualPct = manualLeads.length / leads.length * 100;
-        const onlineLeads = leads.filter(l => normalizeChannel(l.channel) === 'Online Booking');
+        const onlineLeads = leads.filter(l => normalizeChannel(getLeadChannel(l)) === 'Online Booking');
         const manualConv = manualLeads.length > 0 ?
             manualLeads.filter(l => l.converted_status === 'Converted').length / manualLeads.length * 100 : 0;
         const onlineConv = onlineLeads.length > 0 ?
@@ -5086,7 +5352,7 @@
 
         // Action 1: Online booking default (maps to channel-bottleneck)
         const manualPct = leads.filter(l =>
-            normalizeChannel(l.channel) === 'Walk-in' || normalizeChannel(l.channel) === 'Phone'
+            normalizeChannel(getLeadChannel(l)) === 'Walk-in' || normalizeChannel(getLeadChannel(l)) === 'Phone'
         ).length / leads.length * 100;
 
         if (manualPct > 40) {
@@ -5660,7 +5926,7 @@
         const locationStats = computeLocationStats(leads, customers);
         const channelByLoc = {};
         leads.forEach(l => {
-            const ch = normalizeChannel(l.channel);
+            const ch = normalizeChannel(getLeadChannel(l));
             const loc = l.company_name || 'Unknown';
             const key = `${loc}|${ch}`;
             if (!channelByLoc[key]) channelByLoc[key] = { loc, ch, leads: 0, converted: 0 };
